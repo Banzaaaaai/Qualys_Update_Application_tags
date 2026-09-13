@@ -68,8 +68,8 @@ its tag must keep working, or be created if missing.
 | ASSET in CMDB, tag exists, `NETWORK_RANGE`, IPs already match | `NO_CHANGE` |
 | ASSET in CMDB, tag exists, `STATIC`, CMDB has usable IPs | **CONVERT** in place to `NETWORK_RANGE` — same tag id/name/parent |
 | ASSET in CMDB, tag exists, `STATIC`, no usable IPs | Left **completely untouched**, reported `NO_USABLE_IPS` |
-| ASSET in CMDB, tag exists, `NAME_CONTAINS` | **Never written to.** Reported `SKIPPED_UNSAFE_RULE_TYPE` |
-| ASSET in CMDB, tag exists, unrecognized rule type | **ERROR** — fails safe at the tag level, never guessed at |
+| ASSET in CMDB, tag exists, `NAME_CONTAINS` / `GROOVY` / `ASSET_SEARCH` | **Never written to.** Reported `SKIPPED_UNSAFE_RULE_TYPE` — requires manual review |
+| ASSET in CMDB, tag exists, any other unrecognized rule type | **ERROR** — fails safe at the tag level, never guessed at |
 | Tag exists, ASSET absent from CMDB entirely | **DELETE** candidate (gated by `--apply --allow-delete`) |
 | Tag exists, every CMDB row for that ASSET is `Out of Service` | **DELETE** candidate, same gating (see delete policy below) |
 | Tag exists, ASSET present with any usable/live resource | Never a delete candidate, even with zero current IPs |
@@ -158,8 +158,12 @@ reported but nothing is removed.
   the process exits non-zero — partial failures are never hidden.
 - **Protected tags.** Anything matching `PROTECTED_TAG_PATTERNS` (by default
   just the parent tag's own name) is never a deletion candidate.
-- **NAME_CONTAINS and unrecognized rule types are never guessed at.** They
-  are reported and left completely alone.
+- **`NAME_CONTAINS`, `GROOVY`, `ASSET_SEARCH`, and any other unrecognized
+  rule type are never guessed at.** They are reported (`SKIPPED_UNSAFE_RULE_TYPE`
+  for the first three, `ERROR` for anything else) and left completely
+  alone — never written to, never deleted, even when the tag's name has no
+  literal match in the CMDB. These require a human to review and update
+  manually.
 
 ---
 

@@ -95,6 +95,13 @@ class TestAssetNameNormalization(unittest.TestCase):
         raw = "AAA (Authentication, Authorization and Accounting) (IP Works)"
         self.assertEqual(app.normalize_asset_name(raw), raw)
 
+    def test_strips_invisible_format_characters(self):
+        # U+200B ZERO WIDTH SPACE is a real copy/paste artifact observed in
+        # CMDB ASSET values; left in place it silently defeats name matching
+        # and can crash console output on a codepage that can't render it.
+        self.assertEqual(app.normalize_asset_name("CMS​ Platform"), "CMS Platform")
+        self.assertEqual(app.normalize_asset_name("﻿CMS"), "CMS")
+
     def test_gaid_key_strips_float_suffix(self):
         self.assertEqual(app.normalize_gaid_key(5014.0), "5014")
         self.assertEqual(app.normalize_gaid_key("5014.0"), "5014")
@@ -301,12 +308,76 @@ class TestChangePlannerUpdate(unittest.TestCase):
         rows = planner.plan()
         self.assertEqual(rows[0]["action"], app.ACTION_SKIP_UNSUPPORTED)
 
+    def test_groovy_and_asset_search_tags_are_never_overwritten(self):
+        # These require manual review by a human -- never an automated write.
+        for rule_type in ("GROOVY", "ASSET_SEARCH"):
+            with self.subTest(rule_type=rule_type):
+                tag = make_tag("[VFZ] CMS", rule_type=rule_type, rule_text="")
+                apps = {"CMS": make_application("CMS", ips=["10.1.1.10"])}
+                planner = make_planner(apps, children=[tag])
+                rows = planner.plan()
+                self.assertEqual(rows[0]["action"], app.ACTION_SKIP_UNSUPPORTED)
+                self.assertIn(rule_type, rows[0]["reason"])
+
     def test_unexpected_rule_type_fails_safe(self):
         tag = make_tag("[VFZ] CMS", rule_type="SOME_FUTURE_TYPE", rule_text="")
         apps = {"CMS": make_application("CMS", ips=["10.1.1.10"])}
         planner = make_planner(apps, children=[tag])
         rows = planner.plan()
         self.assertEqual(rows[0]["action"], app.ACTION_ERROR)
+
+
+class TestChangePlannerCaseInsensitiveMatch(unittest.TestCase):
+    def test_casing_only_mismatch_updates_existing_tag_without_renaming(self):
+        # Regression: a live tenant had 8 CMDB/tag pairs differing only by
+        # case (e.g. tag "[VFZ] Cyberark" vs CMDB ASSET "CyberArk"), which
+        # exact matching alone would treat as delete-old + create-new.
+        tag = make_tag("[VFZ] Cyberark", rule_type="NETWORK_RANGE", rule_text="10.1.1.1")
+        apps = {"CyberArk": make_application("CyberArk", ips=["10.1.1.2"])}
+        planner = make_planner(apps, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["action"], app.ACTION_UPDATE)
+        self.assertEqual(rows[0]["qualys_tag_name"], "[VFZ] Cyberark")  # name NOT changed
+        self.assertIn("matched case-insensitively", rows[0]["reason"])
+
+    def test_casing_only_mismatch_with_rename_tags_flag_renames(self):
+        tag = make_tag("[VFZ] Cyberark", rule_type="NETWORK_RANGE", rule_text="10.1.1.1")
+        apps = {"CyberArk": make_application("CyberArk", ips=["10.1.1.1"])}
+        planner = make_planner(apps, children=[tag], rename_tags=True)
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_UPDATE)
+        self.assertEqual(rows[0]["_new_name"], "[VFZ] CyberArk")
+
+    def test_whitespace_only_mismatch_also_matches(self):
+        tag = make_tag("[VFZ] I&M  portal", rule_type="NETWORK_RANGE", rule_text="10.1.1.1")
+        apps = {"I&M portal": make_application("I&M portal", ips=["10.1.1.1"])}
+        planner = make_planner(apps, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_NO_CHANGE)
+        self.assertEqual(rows[0]["qualys_tag_name"], "[VFZ] I&M  portal")
+
+    def test_ambiguous_case_insensitive_match_fails_safe(self):
+        tag_a = make_tag("[VFZ] Foo", tag_id="1", rule_type="NETWORK_RANGE")
+        tag_b = make_tag("[VFZ] FOO", tag_id="2", rule_type="NETWORK_RANGE")
+        apps = {"foo": make_application("foo", ips=["10.1.1.1"])}
+        planner = make_planner(apps, children=[tag_a, tag_b])
+        rows = planner.plan()
+        # one ERROR for the ambiguous application, plus two now-unclaimed
+        # orphan tags evaluated independently.
+        app_row = [r for r in rows if r["application"] == "foo" and r["qualys_tag_id"] == ""]
+        self.assertEqual(len(app_row), 1)
+        self.assertEqual(app_row[0]["action"], app.ACTION_ERROR)
+
+    def test_exact_match_preferred_over_case_insensitive(self):
+        exact = make_tag("[VFZ] CyberArk", tag_id="1", rule_type="NETWORK_RANGE", rule_text="10.1.1.1")
+        other_case = make_tag("[VFZ] Cyberark", tag_id="2", rule_type="NETWORK_RANGE", rule_text="10.1.1.1")
+        apps = {"CyberArk": make_application("CyberArk", ips=["10.1.1.1"])}
+        planner = make_planner(apps, children=[exact, other_case])
+        rows = planner.plan()
+        app_row = [r for r in rows if r["application"] == "CyberArk" and r["qualys_tag_id"] != ""]
+        self.assertEqual(len(app_row), 1)
+        self.assertEqual(app_row[0]["qualys_tag_id"], "1")  # the exact match, not the casefold one
 
 
 class TestChangePlannerDelete(unittest.TestCase):
@@ -354,6 +425,33 @@ class TestChangePlannerDelete(unittest.TestCase):
         planner = make_planner({}, children=[tag])
         rows = planner.plan()
         self.assertEqual(rows[0]["action"], app.ACTION_SKIP_AMBIGUOUS)
+
+    def test_orphan_name_contains_tag_is_never_deleted(self):
+        # Regression: a live tenant had NAME_CONTAINS / GROOVY / ASSET_SEARCH
+        # tags proposed for deletion merely because their name had no literal
+        # CMDB match -- the same rule-type protection the forward pass
+        # applies to writes must also gate the orphan/delete pass.
+        tag = make_tag("[VFZ] Unify", rule_type="NAME_CONTAINS", rule_text="host.*")
+        planner = make_planner({}, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_SKIP_UNSUPPORTED)
+
+    def test_orphan_groovy_and_asset_search_tags_are_never_deleted(self):
+        # GROOVY (a scripted rule) and ASSET_SEARCH (matches by e.g. QID) are
+        # recognized-but-unsafe rule types, same tier as NAME_CONTAINS -- a
+        # human must update these manually, not this script.
+        for rule_type in ("GROOVY", "ASSET_SEARCH"):
+            with self.subTest(rule_type=rule_type):
+                tag = make_tag("[VFZ] Amdocs RevenueOne", rule_type=rule_type)
+                planner = make_planner({}, children=[tag])
+                rows = planner.plan()
+                self.assertEqual(rows[0]["action"], app.ACTION_SKIP_UNSUPPORTED)
+
+    def test_orphan_genuinely_unexpected_rule_type_fails_safe_not_deleted(self):
+        tag = make_tag("[VFZ] Some New Tag", rule_type="SOME_FUTURE_TYPE")
+        planner = make_planner({}, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_ERROR)
 
 
 # --------------------------------------------------------------------------

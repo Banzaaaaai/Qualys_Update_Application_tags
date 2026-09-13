@@ -91,7 +91,12 @@ CHILD_TAG_PREFIX = "[VFZ] "
 
 EXPECTED_RULE_TYPE = "NETWORK_RANGE"
 STATIC_RULE_TYPES = {"", "STATIC"}
-NEVER_UPDATE_RULE_TYPES = {"NAME_CONTAINS"}
+# Rule types this script recognizes but will never write to or delete,
+# whatever the CMDB says -- they require a human to review and update
+# manually. NAME_CONTAINS matches by hostname pattern; GROOVY is a scripted
+# rule; ASSET_SEARCH matches by an arbitrary saved search (e.g. by QID).
+# None of these have a safe automated translation to/from an IP-range rule.
+NEVER_UPDATE_RULE_TYPES = {"NAME_CONTAINS", "GROOVY", "ASSET_SEARCH"}
 KNOWN_RULE_TYPES = STATIC_RULE_TYPES | NEVER_UPDATE_RULE_TYPES | {EXPECTED_RULE_TYPE}
 
 # Qualys does not publish an exact tag-name length ceiling for AssetView tags;
@@ -396,13 +401,23 @@ def normalize_color(value) -> str:
 
 
 def normalize_asset_name(value) -> str:
-    """Canonical application identity string: Unicode-normalized, tabs/newlines
-    collapsed to spaces, internal whitespace runs collapsed, trimmed. Casing
-    and all other characters are preserved -- the ASSET string is the
-    authoritative tag-name source, not something to be silently lowercased."""
+    """Canonical application identity string: Unicode-normalized, invisible
+    format characters stripped, tabs/newlines collapsed to spaces, internal
+    whitespace runs collapsed, trimmed. Casing and all other visible
+    characters are preserved -- the ASSET string is the authoritative
+    tag-name source, not something to be silently lowercased.
+
+    Real CMDB exports have been observed to carry zero-width spaces / BOM
+    characters (copy/paste artifacts) inside ASSET values. Left in place
+    these become invisible-but-real differences between otherwise-identical
+    names (defeating matching) and can crash console output entirely on a
+    Windows codepage that cannot render them. Unicode category "Cf" covers
+    exactly this class of invisible formatting character.
+    """
     if value is None:
         return ""
     text = unicodedata.normalize("NFKC", str(value))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     text = text.replace("\t", " ").replace("\n", " ").replace("\r", " ")
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -612,14 +627,24 @@ class QualysTagClient:
         tags = self.find_by_name(name)
         return tags[0] if tags else None
 
-    def fetch_children(self, parent_tag_id) -> list[QualysTag]:
-        def criteria(last_id):
-            return (
-                f'<Criteria field="parentTagId" operator="EQUALS">{xml_escape(str(parent_tag_id))}</Criteria>'
-                f'<Criteria field="id" operator="GREATER">{last_id}</Criteria>'
-            )
+    def fetch_all(self) -> list[QualysTag]:
+        """Enumerate every tag in the tenant via plain id-cursor pagination.
 
-        return self._search_paginated(criteria, "search children")
+        Qualys' am/tag search does not accept "parentTagId" as a filter
+        field (confirmed live: INVALID_REQUEST names the valid set as
+        parent, color, provider, ruleType, name, id, criticalityScore) and
+        the semantics of "parent" there are not documented clearly enough to
+        rely on. Fetching everything and filtering by parent_tag_id
+        client-side, as the GAID script does, is the proven-safe approach.
+        """
+
+        def criteria(last_id):
+            return f'<Criteria field="id" operator="GREATER">{last_id}</Criteria>'
+
+        return self._search_paginated(criteria, "search all tags")
+
+    def fetch_children(self, parent_tag_id) -> list[QualysTag]:
+        return [t for t in self.fetch_all() if t.parent_tag_id == str(parent_tag_id)]
 
     def update(self, tag_id, fields_xml, label) -> None:
         xml_body = f"<ServiceRequest><data><Tag>{fields_xml}</Tag></data></ServiceRequest>"
@@ -640,6 +665,16 @@ class QualysTagClient:
 # ==========================================================================
 
 
+def normalize_for_case_match(name: str) -> str:
+    """Casefold + whitespace-collapse a tag/asset name for identity matching
+    that is insensitive to case and incidental whitespace differences (e.g.
+    'Cyberark' vs 'CyberArk', 'I&M portal' vs 'I&M Portal'). This is used
+    only to FIND the right existing tag; the tag's own name is left exactly
+    as-is unless --rename-tags is also passed -- ASSET casing is CMDB
+    metadata, not grounds for an automatic rename."""
+    return re.sub(r"\s+", " ", name.strip()).casefold()
+
+
 class QualysTagModel:
     """Holds the resolved parent tag and its direct child tags."""
 
@@ -647,6 +682,9 @@ class QualysTagModel:
         self.parent = parent
         self.children = children
         self.by_name: dict[str, QualysTag] = {t.tag_name: t for t in children}
+        self.by_name_casefold: dict[str, list[QualysTag]] = {}
+        for t in children:
+            self.by_name_casefold.setdefault(normalize_for_case_match(t.tag_name), []).append(t)
         self.by_gaid: dict[str, QualysTag] = {}
         for t in children:
             gaid = t.gaid_from_description
@@ -978,9 +1016,37 @@ class ChangePlanner:
             )
 
         tag = self.tag_model.by_name.get(desired_name)
+        match_note = ""
+
+        # Case/whitespace-insensitive fallback: CMDB spelling drifts (e.g.
+        # "Cyberark" -> "CyberArk") must not read as "old app gone, new app
+        # appeared". The existing tag is matched and its IP scope
+        # reconciled; its name is left exactly as-is unless --rename-tags is
+        # also passed (see the "renamed" handling in _plan_existing).
+        if tag is None:
+            norm_key = normalize_for_case_match(desired_name)
+            unclaimed = [
+                t for t in self.tag_model.by_name_casefold.get(norm_key, [])
+                if t.tag_id not in claimed_tag_ids
+            ]
+            if len(unclaimed) == 1:
+                tag = unclaimed[0]
+                match_note = (
+                    f"matched case-insensitively (existing tag name {tag.tag_name!r} differs "
+                    f"from CMDB ASSET only by case/whitespace)"
+                )
+            elif len(unclaimed) > 1:
+                return _new_row(
+                    action=ACTION_ERROR,
+                    verification_status="NOT_APPLICABLE",
+                    reason="multiple existing tags match this application case-insensitively; ambiguous",
+                    error_message="candidates: " + ", ".join(t.tag_name for t in unclaimed),
+                    **common,
+                )
 
         # Optional rename-safe matching via a GAID recorded in an existing
-        # tag's description, when the exact name no longer matches.
+        # tag's description, when neither exact nor case-insensitive
+        # matching found anything.
         if tag is None and self.rename_tags and app.gaid:
             candidate = self.tag_model.by_gaid.get(app.gaid)
             if candidate is not None and candidate.tag_id not in claimed_tag_ids:
@@ -991,7 +1057,7 @@ class ChangePlanner:
 
         if tag is None:
             return self._plan_create(app, desired_name, common)
-        return self._plan_existing(app, tag, desired_name, common)
+        return self._plan_existing(app, tag, desired_name, common, match_note)
 
     def _plan_create(self, app: ApplicationRecord, desired_name: str, common: dict) -> dict:
         if app.desired_ips:
@@ -1032,7 +1098,9 @@ class ChangePlanner:
             **common,
         )
 
-    def _plan_existing(self, app: ApplicationRecord, tag: QualysTag, desired_name: str, common: dict) -> dict:
+    def _plan_existing(
+        self, app: ApplicationRecord, tag: QualysTag, desired_name: str, common: dict, match_note: str = ""
+    ) -> dict:
         old_ips, _ = parse_qualys_rule_text(tag.rule_text)
         base = dict(
             qualys_tag_id=tag.tag_id,
@@ -1045,10 +1113,16 @@ class ChangePlanner:
         color_differs = self.manage_color and normalize_color(tag.color) != normalize_color(DEFAULT_TAG_COLOR)
         renamed = tag.tag_name != desired_name
 
+        def with_note(reason: str) -> str:
+            return f"{reason}; {match_note}" if match_note else reason
+
         if tag.rule_type in NEVER_UPDATE_RULE_TYPES:
             return _new_row(
                 action=ACTION_SKIP_UNSUPPORTED,
-                reason="SKIPPED_UNSAFE_RULE_TYPE: NAME_CONTAINS tags are never overwritten",
+                reason=with_note(
+                    f"SKIPPED_UNSAFE_RULE_TYPE: {tag.rule_type} tags are never written to "
+                    "automatically -- requires manual review"
+                ),
                 verification_status="NOT_APPLICABLE",
                 **base,
             )
@@ -1056,7 +1130,7 @@ class ChangePlanner:
         if tag.rule_type not in KNOWN_RULE_TYPES:
             return _new_row(
                 action=ACTION_ERROR,
-                reason="unexpected ruleType; failing safe at tag level",
+                reason=with_note("unexpected ruleType; failing safe at tag level"),
                 error_message=f"ruleType {tag.rule_type!r} is not one of {sorted(KNOWN_RULE_TYPES)}",
                 verification_status="NOT_APPLICABLE",
                 **base,
@@ -1070,7 +1144,7 @@ class ChangePlanner:
                 reason += f"; would also rename to {desired_name!r}"
             return _new_row(
                 action=ACTION_UPDATE if (renamed and self.rename_tags) or color_differs else ACTION_NO_CHANGE,
-                reason=reason,
+                reason=with_note(reason),
                 verification_status="NOT_APPLICABLE" if not ((renamed and self.rename_tags) or color_differs) else "PENDING",
                 _rename_only=renamed and self.rename_tags,
                 _new_name=desired_name if (renamed and self.rename_tags) else "",
@@ -1087,8 +1161,10 @@ class ChangePlanner:
                 new_ip_count=len(app.desired_ips),
                 ips_added=", ".join(app.desired_ips),
                 ips_added_count=len(app.desired_ips),
-                reason="static tag converted in place to NETWORK_RANGE (CMDB has usable IPs)"
-                + (f"; renamed to {desired_name!r}" if renamed and self.rename_tags else ""),
+                reason=with_note(
+                    "static tag converted in place to NETWORK_RANGE (CMDB has usable IPs)"
+                    + (f"; renamed to {desired_name!r}" if renamed and self.rename_tags else "")
+                ),
                 verification_status="PENDING",
                 _new_ips=app.desired_ips,
                 _is_conversion=True,
@@ -1104,7 +1180,7 @@ class ChangePlanner:
             do_something = color_differs or (renamed and self.rename_tags)
             return _new_row(
                 action=ACTION_UPDATE if do_something else ACTION_NO_CHANGE,
-                reason=reason,
+                reason=with_note(reason),
                 verification_status="PENDING" if do_something else "NOT_APPLICABLE",
                 _rename_only=renamed and self.rename_tags and not color_differs,
                 _color_only=color_differs,
@@ -1117,7 +1193,7 @@ class ChangePlanner:
         old_set, new_set = set(old_ips), set(app.desired_ips)
         added = sorted(new_set - old_set, key=lambda c: app.desired_ips.index(c) if c in app.desired_ips else 0)
         removed = sorted(old_set - new_set, key=lambda c: old_ips.index(c) if c in old_ips else 0)
-        has_diff = old_set != new_set or renamed or color_differs
+        has_diff = old_set != new_set or (renamed and self.rename_tags) or color_differs
 
         return _new_row(
             action=ACTION_UPDATE if has_diff else ACTION_NO_CHANGE,
@@ -1127,8 +1203,10 @@ class ChangePlanner:
             ips_added_count=len(added),
             ips_removed=", ".join(removed),
             ips_removed_count=len(removed),
-            reason="IP set differs from CMDB" if old_set != new_set else (
-                "colour/name reconciliation only" if has_diff else "already matches CMDB"
+            reason=with_note(
+                "IP set differs from CMDB" if old_set != new_set else (
+                    "colour/name reconciliation only" if has_diff else "already matches CMDB"
+                )
             ),
             verification_status="PENDING" if has_diff else "NOT_APPLICABLE",
             _new_ips=app.desired_ips,
@@ -1158,6 +1236,30 @@ class ChangePlanner:
                     verification_status="NOT_APPLICABLE",
                     **base,
                 )
+
+        # Rule-type safety applies to deletion exactly as it applies to
+        # writes: NAME_CONTAINS / GROOVY / ASSET_SEARCH tags (and any
+        # unrecognized type) are never removed just because their name
+        # doesn't literally appear in this month's CMDB -- the CMDB may
+        # represent the same application differently, and these rule types
+        # are never guessed at; a human must review and update them.
+        if tag.rule_type in NEVER_UPDATE_RULE_TYPES:
+            return _new_row(
+                action=ACTION_SKIP_UNSUPPORTED,
+                reason=f"SKIPPED_UNSAFE_RULE_TYPE: {tag.rule_type} tags are never deleted "
+                "automatically, even when their name has no literal CMDB match -- requires "
+                "manual review",
+                verification_status="NOT_APPLICABLE",
+                **base,
+            )
+        if tag.rule_type not in KNOWN_RULE_TYPES:
+            return _new_row(
+                action=ACTION_ERROR,
+                reason="unexpected ruleType; failing safe rather than guessing whether deletion is safe",
+                error_message=f"ruleType {tag.rule_type!r} is not one of {sorted(KNOWN_RULE_TYPES)}",
+                verification_status="NOT_APPLICABLE",
+                **base,
+            )
 
         if not tag.tag_name.startswith(CHILD_TAG_PREFIX):
             return _new_row(
@@ -1689,7 +1791,26 @@ def _print_summary(rows: list[dict], applied: bool) -> None:
         print(f"  Failed verifications:       {failed}")
 
 
+def _make_console_encoding_safe() -> None:
+    """CMDB ASSET names have been observed to carry stray Unicode (e.g. a
+    zero-width space from a copy/paste) that a Windows console's legacy
+    codepage cannot render. Without this, a plain print() of such a value
+    crashes the whole run with UnicodeEncodeError deep into printing the
+    plan -- after CMDB parsing and the Qualys tag fetch already happened.
+    Report files are unaffected (they are opened with encoding="utf-8"
+    explicitly); this only hardens interactive console output.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main() -> int:
+    _make_console_encoding_safe()
     args = parse_args()
     apply_mode = bool(args.apply)
     allow_delete = apply_mode and bool(args.allow_delete)
