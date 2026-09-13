@@ -1,0 +1,8 @@
+qualys_creds.txt
+asset-resource-owner.xlsx
+application_tag_report_*.csv
+application_tag_report_*.xlsx
+backup_application_tags_*.json
+backup_application_tags_*.xlsx
+__pycache__/
+*.pyc
