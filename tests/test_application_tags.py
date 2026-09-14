@@ -218,8 +218,8 @@ def make_tag(name, rule_type="NETWORK_RANGE", rule_text="", color="#0000FF", des
     )
 
 
-def make_application(asset, gaid="1", ips=None, all_row_statuses=None):
-    rec = app.ApplicationRecord(asset=asset, gaid=gaid)
+def make_application(asset, gaid="1", ips=None, all_row_statuses=None, rvit=""):
+    rec = app.ApplicationRecord(asset=asset, gaid=gaid, rvit=rvit)
     rec.desired_ips = ips or []
     rec.all_row_statuses = all_row_statuses if all_row_statuses is not None else ["In Service"]
     return rec
@@ -230,10 +230,91 @@ def make_planner(applications, children, **kwargs):
     model = app.QualysTagModel(parent, children)
     return app.ChangePlanner(
         applications, model,
-        manage_color=kwargs.get("manage_color", False),
         create_tags_without_ips=kwargs.get("create_tags_without_ips", False),
         rename_tags=kwargs.get("rename_tags", False),
     )
+
+
+class TestChangePlannerColor(unittest.TestCase):
+    def test_create_defaults_to_blue(self):
+        apps = {"CMS": make_application("CMS", ips=["10.1.1.10"], rvit="no")}
+        planner = make_planner(apps, children=[])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["_new_color"], app.DEFAULT_TAG_COLOR)
+
+    def test_create_with_rvit_yes_is_red(self):
+        apps = {"CMS": make_application("CMS", ips=["10.1.1.10"], rvit="yes")}
+        planner = make_planner(apps, children=[])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["_new_color"], app.CRITICAL_TAG_COLOR)
+
+    def test_rvit_match_is_case_insensitive(self):
+        for value in ("YES", "Yes", " yes "):
+            with self.subTest(value=value):
+                apps = {"CMS": make_application("CMS", ips=["10.1.1.10"], rvit=value)}
+                planner = make_planner(apps, children=[])
+                rows = planner.plan()
+                self.assertEqual(rows[0]["_new_color"], app.CRITICAL_TAG_COLOR)
+
+    def test_existing_network_range_tag_recoloured_to_red_with_no_other_change(self):
+        tag = make_tag("[VFZ] CMS", rule_type="NETWORK_RANGE", rule_text="10.1.1.10", color="#0000FF")
+        apps = {"CMS": make_application("CMS", ips=["10.1.1.10"], rvit="yes")}
+        planner = make_planner(apps, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_UPDATE)
+        self.assertEqual(rows[0]["_new_color"], app.CRITICAL_TAG_COLOR)
+        self.assertEqual(rows[0]["ips_added"], "")  # IP set itself is unchanged
+        self.assertEqual(rows[0]["ips_removed"], "")
+
+    def test_already_correct_color_is_no_change(self):
+        tag = make_tag("[VFZ] CMS", rule_type="NETWORK_RANGE", rule_text="10.1.1.10", color="#FF0000")
+        apps = {"CMS": make_application("CMS", ips=["10.1.1.10"], rvit="yes")}
+        planner = make_planner(apps, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_NO_CHANGE)
+
+    def test_color_applies_unconditionally_to_name_contains_tag(self):
+        # The key requirement: colour is corrected even for a rule type this
+        # script otherwise never writes to -- colour is independent of the
+        # rule content that makes NAME_CONTAINS unsafe to touch.
+        tag = make_tag("[VFZ] CMS", rule_type="NAME_CONTAINS", rule_text="host.*", color="#0000FF")
+        apps = {"CMS": make_application("CMS", ips=["10.1.1.10"], rvit="yes")}
+        planner = make_planner(apps, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_UPDATE)
+        self.assertTrue(rows[0]["_color_only"])
+        self.assertEqual(rows[0]["_new_color"], app.CRITICAL_TAG_COLOR)
+
+    def test_color_applies_unconditionally_to_static_tag_with_no_ips(self):
+        tag = make_tag("[VFZ] Toolbox", rule_type="STATIC", rule_text="", color="#0000FF")
+        apps = {"Toolbox": make_application("Toolbox", ips=[], rvit="yes")}
+        planner = make_planner(apps, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_UPDATE)
+        self.assertEqual(rows[0]["_new_color"], app.CRITICAL_TAG_COLOR)
+
+    def test_orphan_name_contains_tag_recoloured_when_application_still_in_cmdb(self):
+        # Rare data-quality edge case: tag name matches a CMDB asset by the
+        # recovered-name guess but wasn't claimed by the forward pass.
+        tag = make_tag("[VFZ] Weird App", rule_type="NAME_CONTAINS", rule_text="host.*", color="#0000FF")
+        apps = {"Weird App": make_application("Weird App", ips=["10.1.1.10"], rvit="yes")}
+        model = app.QualysTagModel(make_tag(app.TARGET_PARENT_TAG_NAME, tag_id="999", parent_tag_id=""), [tag])
+        planner = app.ChangePlanner(apps, model, create_tags_without_ips=False, rename_tags=False)
+        # Force the orphan path directly (bypassing the forward-pass claim)
+        # to exercise _plan_orphan_tag's own colour handling in isolation.
+        row = planner._plan_orphan_tag(tag)
+        self.assertEqual(row["action"], app.ACTION_UPDATE)
+        self.assertEqual(row["_new_color"], app.CRITICAL_TAG_COLOR)
+
+    def test_orphan_tag_with_no_cmdb_application_has_no_color_opinion(self):
+        # No RVIT data exists for a genuinely absent application, so colour
+        # cannot be determined -- this is not an "exception" to the rule,
+        # there is simply no data to apply it to.
+        tag = make_tag("[VFZ] Gone App", rule_type="NETWORK_RANGE", rule_text="10.1.1.1", color="#00FF00")
+        planner = make_planner({}, children=[tag])
+        rows = planner.plan()
+        self.assertEqual(rows[0]["action"], app.ACTION_DELETE)
+        self.assertEqual(rows[0].get("_new_color"), None)
 
 
 class TestChangePlannerCreate(unittest.TestCase):
@@ -495,14 +576,17 @@ class TestPreflightBlastRadius(unittest.TestCase):
             force_large_change=True,
         )  # must not raise
 
-    def test_child_count_ceiling_blocks_creates_regardless_of_force_flag(self):
+    def test_child_count_ceiling_is_advisory_not_blocking(self):
+        # Regression: the documented 350-per-parent Qualys limit is
+        # contradicted by live tenant evidence (607 existing children on the
+        # real [VFZ] Applications & Platforms parent). Exceeding it must
+        # only warn, never abort -- Qualys' own API is the real authority.
         rows = self._rows(n_create=10)
-        with self.assertRaises(app.PreflightError):
-            app.PreflightValidator.validate_plan(
-                rows, existing_child_count=app.MAX_CHILDREN_PER_PARENT - 5, apply_mode=True,
-                allow_delete=False, max_create=1000, max_update=1000, max_delete=1000,
-                max_total=1000, max_percentage=1000, force_large_change=True,
-            )
+        app.PreflightValidator.validate_plan(
+            rows, existing_child_count=app.MAX_CHILDREN_PER_PARENT - 5, apply_mode=True,
+            allow_delete=False, max_create=1000, max_update=1000, max_delete=1000,
+            max_total=1000, max_percentage=1000, force_large_change=False,
+        )  # must not raise
 
     def test_deletes_excluded_from_delete_limit_when_allow_delete_false(self):
         rows = self._rows(n_delete=1000)

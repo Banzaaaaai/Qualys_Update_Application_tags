@@ -131,6 +131,29 @@ reported but nothing is removed.
 
 ---
 
+## Tag colour
+
+Colour is driven entirely by the CMDB's `RVIT` column and is **unconditional
+— applied to every application tag this script manages, no exceptions**:
+
+- `RVIT` = `yes` (case-insensitive, whitespace-trimmed) → `#FF0000` (`CRITICAL_TAG_COLOR`)
+- anything else (`no`, blank, any other value) → `#0000FF` (`DEFAULT_TAG_COLOR`)
+
+This applies to every newly created tag, and to every existing tag whose
+colour doesn't already match — **including `NAME_CONTAINS`, `GROOVY`, and
+`ASSET_SEARCH` tags**, whose rule content is otherwise never touched. Colour
+is a field entirely independent of `ruleType`/`ruleText`, so correcting it
+never risks a tag's matching behaviour: the write sends only `<color>`, the
+rule stays exactly as it was. There is no flag to disable this — it always
+runs, on every run.
+
+The one genuine limit: a tag with no corresponding CMDB application record
+(a true orphan, already a `DELETE` candidate) has no `RVIT` value to read,
+so there is nothing to recolour it to — this isn't an exception to the rule,
+there is simply no data to apply it from.
+
+---
+
 ## Safety controls
 
 - **Preflight, fail-closed.** GAID↔ASSET 1:1 validation and blank-ASSET rows
@@ -138,10 +161,14 @@ reported but nothing is removed.
   is made. See `PreflightValidator.validate_source`.
 - **Parent resolved by exact name, never hardcoded.** The script aborts if
   zero or more than one tag named `[VFZ] Applications & Platforms` exists.
-- **350-child-tag ceiling.** Before any create, the script checks
-  `existing_children + planned_creates` against Qualys' documented 350
-  children-per-parent limit and fails closed (no partial creation) if it
-  would be exceeded.
+- **350-child-tag ceiling — advisory only.** The CSAM architecture document
+  states a 350 children-per-parent Qualys limit; the script checks
+  `existing_children + planned_creates` against it and prints a warning if
+  exceeded, but does **not** abort. Live-tenant evidence contradicts this as
+  a hard, currently-enforced cap: `[VFZ] Applications & Platforms` already
+  carries 607 child tags. Qualys' own API response is the real authority on
+  any genuine per-create rejection, and a failed create is reported for
+  that row only — it never aborts the rest of the batch.
 - **Blast-radius guardrails** (`--apply` only): `MAX_CREATE_CHANGES`,
   `MAX_UPDATE_CHANGES`, `MAX_DELETE_CHANGES`, `MAX_TOTAL_CHANGES`, and
   `MAX_PERCENTAGE_CHANGED` (percentage of existing child tags touched) all
@@ -257,7 +284,6 @@ Useful options:
 | `--dry-run` | Explicit no-op preview (this is also the default with no mode flag) |
 | `--apply` | Perform real, non-destructive Qualys writes |
 | `--allow-delete` | Also permit deletions (requires `--apply`) |
-| `--manage-color` | Reconcile existing tags' colour to `DEFAULT_TAG_COLOR` (`#0000FF`) when it differs. New tags always get this colour regardless of this flag. |
 | `--create-static-for-no-ip` | Create a placeholder `STATIC` tag for a CMDB application with no usable IPs, instead of reporting `MISSING_TAG_NO_IP_SCOPE` and creating nothing (default) |
 | `--rename-tags` | Match an existing tag to an application via the GAID recorded in its description when the exact name no longer matches, and rename the tag in place instead of create+delete |
 | `--max-create` / `--max-update` / `--max-delete` / `--max-total` / `--max-percentage-changed` | Override the blast-radius guardrails |
@@ -305,5 +331,7 @@ includes: GAID/ASSET 1:1 validation, blank-ASSET detection, IP parsing and
 range expansion/compaction, excluded-network filtering, resource-status
 filtering, all-resources-out-of-service detection, no-usable-IP safety
 behavior, `NETWORK_RANGE` diffing, `STATIC → NETWORK_RANGE` conversion,
-`NAME_CONTAINS` skip behavior, create/delete gating, and blast-radius
+`NAME_CONTAINS`/`GROOVY`/`ASSET_SEARCH` skip behavior, case-insensitive
+ASSET matching, unconditional RVIT-driven tag colour (including for
+otherwise-untouched rule types), create/delete gating, and blast-radius
 threshold enforcement.

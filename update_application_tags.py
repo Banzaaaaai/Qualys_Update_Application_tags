@@ -104,7 +104,15 @@ KNOWN_RULE_TYPES = STATIC_RULE_TYPES | NEVER_UPDATE_RULE_TYPES | {EXPECTED_RULE_
 # safely at plan time instead of producing a confusing API error at write time.
 MAX_TAG_NAME_LENGTH = 256
 
-# Qualys' documented CSAM limit on child tags per parent (see architecture doc).
+# The VodafoneZiggo CSAM architecture document states a 350-child-tags-per-
+# parent Qualys limit. Live-tenant evidence contradicts that as a hard,
+# currently-enforced cap for this parent: [VFZ] Applications & Platforms
+# already carries 607 child tags. Rather than guess why (grandfathered,
+# raised entitlement, limit misdocumented, or specific to a different
+# feature), this is advisory only -- exceeding it prints a warning but never
+# blocks a run. Qualys' own API response is the actual authority on any real
+# per-create rejection, and a failed create is caught and reported per-row
+# (see ChangeExecutor.apply_create) without aborting the rest of the batch.
 MAX_CHILDREN_PER_PARENT = 350
 
 EXCLUDED_IP_NETWORKS = ("169.254.0.0/16", "192.168.0.0/16")
@@ -128,7 +136,13 @@ DELETE_ON_RESOURCE_STATUSES = {"out of service"}
 ENABLE_DELETE_BY_ALL_RESOURCES_OOS = True
 
 DEFAULT_TAG_COLOR = "#0000FF"
-ENABLE_COLOR_RECONCILIATION_DEFAULT = False
+CRITICAL_TAG_COLOR = "#FF0000"
+# Colour is driven purely by the CMDB's RVIT column and applies to every
+# application tag this script manages, unconditionally -- including
+# NAME_CONTAINS/GROOVY/ASSET_SEARCH tags whose rule content is otherwise
+# never touched. Colour is an independent field from ruleType/ruleText, so
+# correcting it never risks that tag's matching behaviour.
+RVIT_CRITICAL_VALUES = {"yes"}
 CREATE_TAGS_WITHOUT_IPS_DEFAULT = False
 
 NEW_TAG_DESCRIPTION_TEMPLATE = "{asset} (GAID: {gaid})"
@@ -832,6 +846,10 @@ class ApplicationRecord:
     def asset_status_display(self) -> str:
         return ", ".join(sorted(s for s in self.asset_status_labels if s))
 
+    @property
+    def desired_color(self) -> str:
+        return CRITICAL_TAG_COLOR if normalize_status(self.rvit) in RVIT_CRITICAL_VALUES else DEFAULT_TAG_COLOR
+
 
 @dataclass
 class ValidationError:
@@ -957,13 +975,11 @@ class ChangePlanner:
         self,
         applications: dict[str, ApplicationRecord],
         tag_model: QualysTagModel,
-        manage_color: bool,
         create_tags_without_ips: bool,
         rename_tags: bool,
     ):
         self.applications = applications
         self.tag_model = tag_model
-        self.manage_color = manage_color
         self.create_tags_without_ips = create_tags_without_ips
         self.rename_tags = rename_tags
 
@@ -1074,7 +1090,7 @@ class ChangePlanner:
                 verification_status="PENDING",
                 _new_ips=app.desired_ips,
                 _description=description,
-                _new_color=DEFAULT_TAG_COLOR,
+                _new_color=app.desired_color,
                 **common,
             )
         if self.create_tags_without_ips:
@@ -1087,7 +1103,7 @@ class ChangePlanner:
                 _new_ips=[],
                 _description=NEW_TAG_DESCRIPTION_TEMPLATE.format(asset=app.asset, gaid=app.gaid or "unknown"),
                 _create_static=True,
-                _new_color=DEFAULT_TAG_COLOR,
+                _new_color=app.desired_color,
                 **common,
             )
         return _new_row(
@@ -1110,13 +1126,30 @@ class ChangePlanner:
             old_ip_count=len(old_ips),
             **common,
         )
-        color_differs = self.manage_color and normalize_color(tag.color) != normalize_color(DEFAULT_TAG_COLOR)
+        # Colour is unconditional: every application tag's colour is
+        # reconciled to app.desired_color (RVIT=yes -> red, else blue),
+        # regardless of rule type -- colour is independent of ruleType/
+        # ruleText, so this never risks a tag's matching behaviour.
+        color_differs = normalize_color(tag.color) != normalize_color(app.desired_color)
         renamed = tag.tag_name != desired_name
 
         def with_note(reason: str) -> str:
             return f"{reason}; {match_note}" if match_note else reason
 
         if tag.rule_type in NEVER_UPDATE_RULE_TYPES:
+            if color_differs:
+                return _new_row(
+                    action=ACTION_UPDATE,
+                    reason=with_note(
+                        f"{tag.rule_type} tag's rule content is never touched, but its colour "
+                        "is corrected to match RVIT"
+                    ),
+                    verification_status="PENDING",
+                    _color_only=True,
+                    _new_color=app.desired_color,
+                    _tag=tag,
+                    **base,
+                )
             return _new_row(
                 action=ACTION_SKIP_UNSUPPORTED,
                 reason=with_note(
@@ -1149,7 +1182,7 @@ class ChangePlanner:
                 _rename_only=renamed and self.rename_tags,
                 _new_name=desired_name if (renamed and self.rename_tags) else "",
                 _color_only=not (renamed and self.rename_tags),
-                _new_color=DEFAULT_TAG_COLOR if color_differs else "",
+                _new_color=app.desired_color if color_differs else "",
                 _tag=tag,
                 **base,
             )
@@ -1169,7 +1202,7 @@ class ChangePlanner:
                 _new_ips=app.desired_ips,
                 _is_conversion=True,
                 _new_name=desired_name if (renamed and self.rename_tags) else "",
-                _new_color=DEFAULT_TAG_COLOR,
+                _new_color=app.desired_color,
                 _tag=tag,
                 **base,
             )
@@ -1185,7 +1218,7 @@ class ChangePlanner:
                 _rename_only=renamed and self.rename_tags and not color_differs,
                 _color_only=color_differs,
                 _new_name=desired_name if (renamed and self.rename_tags) else "",
-                _new_color=DEFAULT_TAG_COLOR if color_differs else "",
+                _new_color=app.desired_color if color_differs else "",
                 _tag=tag,
                 **base,
             )
@@ -1211,7 +1244,7 @@ class ChangePlanner:
             verification_status="PENDING" if has_diff else "NOT_APPLICABLE",
             _new_ips=app.desired_ips,
             _new_name=desired_name if (renamed and self.rename_tags) else "",
-            _new_color=DEFAULT_TAG_COLOR if color_differs else "",
+            _new_color=app.desired_color if color_differs else "",
             _tag=tag,
             **base,
         )
@@ -1237,6 +1270,22 @@ class ChangePlanner:
                     **base,
                 )
 
+        if not tag.tag_name.startswith(CHILD_TAG_PREFIX):
+            return _new_row(
+                action=ACTION_SKIP_AMBIGUOUS,
+                reason="tag name does not follow the expected '[VFZ] <ASSET>' pattern; left alone",
+                verification_status="NOT_APPLICABLE",
+                **base,
+            )
+
+        # Recover a probable application record so colour (driven by RVIT)
+        # can still be reconciled below even for a tag this pass will
+        # otherwise never touch or will delete-gate on rule type -- colour
+        # is unconditional wherever a CMDB RVIT value is actually known.
+        asset_guess = tag.tag_name[len(CHILD_TAG_PREFIX):]
+        app = self.applications.get(asset_guess)
+        color_differs = app is not None and normalize_color(tag.color) != normalize_color(app.desired_color)
+
         # Rule-type safety applies to deletion exactly as it applies to
         # writes: NAME_CONTAINS / GROOVY / ASSET_SEARCH tags (and any
         # unrecognized type) are never removed just because their name
@@ -1244,6 +1293,21 @@ class ChangePlanner:
         # represent the same application differently, and these rule types
         # are never guessed at; a human must review and update them.
         if tag.rule_type in NEVER_UPDATE_RULE_TYPES:
+            if color_differs:
+                return _new_row(
+                    action=ACTION_UPDATE,
+                    application=asset_guess,
+                    gaid=app.gaid,
+                    asset_status=app.asset_status_display,
+                    resource_status_summary=app.resource_status_summary,
+                    reason=f"{tag.rule_type} tag's rule content is never touched, but its "
+                    "colour is corrected to match RVIT",
+                    verification_status="PENDING",
+                    _color_only=True,
+                    _new_color=app.desired_color,
+                    _tag=tag,
+                    **base,
+                )
             return _new_row(
                 action=ACTION_SKIP_UNSUPPORTED,
                 reason=f"SKIPPED_UNSAFE_RULE_TYPE: {tag.rule_type} tags are never deleted "
@@ -1260,17 +1324,6 @@ class ChangePlanner:
                 verification_status="NOT_APPLICABLE",
                 **base,
             )
-
-        if not tag.tag_name.startswith(CHILD_TAG_PREFIX):
-            return _new_row(
-                action=ACTION_SKIP_AMBIGUOUS,
-                reason="tag name does not follow the expected '[VFZ] <ASSET>' pattern; left alone",
-                verification_status="NOT_APPLICABLE",
-                **base,
-            )
-
-        asset_guess = tag.tag_name[len(CHILD_TAG_PREFIX):]
-        app = self.applications.get(asset_guess)
 
         if app is None:
             return _new_row(
@@ -1303,13 +1356,17 @@ class ChangePlanner:
         # the forward pass -- most likely a data-quality mismatch (e.g. the
         # matched-by-name tag differs textually from the recovered guess).
         return _new_row(
-            action=ACTION_NO_CHANGE,
+            action=ACTION_UPDATE if color_differs else ACTION_NO_CHANGE,
             application=asset_guess,
             gaid=app.gaid,
             asset_status=app.asset_status_display,
             resource_status_summary=app.resource_status_summary,
-            reason="present in CMDB; not deletion-eligible; left unmodified",
-            verification_status="NOT_APPLICABLE",
+            reason="present in CMDB; not deletion-eligible"
+            + ("; colour corrected to match RVIT" if color_differs else "; left unmodified"),
+            verification_status="PENDING" if color_differs else "NOT_APPLICABLE",
+            _color_only=color_differs,
+            _new_color=app.desired_color if color_differs else "",
+            _tag=tag,
             **base,
         )
 
@@ -1356,10 +1413,12 @@ class PreflightValidator:
         deletes = [r for r in plan_rows if r["action"] == ACTION_DELETE]
 
         if apply_mode and existing_child_count + len(creates) > MAX_CHILDREN_PER_PARENT:
-            raise PreflightError(
-                f"Planned result would have {existing_child_count + len(creates)} child tags "
-                f"under {TARGET_PARENT_TAG_NAME!r}, exceeding the Qualys limit of "
-                f"{MAX_CHILDREN_PER_PARENT}. Aborting before any mutation (no partial creation)."
+            print(
+                f"WARNING: planned result would have {existing_child_count + len(creates)} "
+                f"child tags under {TARGET_PARENT_TAG_NAME!r}, past the documented Qualys "
+                f"limit of {MAX_CHILDREN_PER_PARENT} -- proceeding anyway since the tenant "
+                f"already carries {existing_child_count} (see MAX_CHILDREN_PER_PARENT comment). "
+                "Any create Qualys itself rejects will be reported per-row, not abort the batch."
             )
 
         if not apply_mode:
@@ -1729,11 +1788,6 @@ def parse_args():
         help="Also permit deletions. Requires --apply. Ignored otherwise.",
     )
     parser.add_argument(
-        "--manage-color",
-        action="store_true",
-        help="Reconcile existing tags' colour to DEFAULT_TAG_COLOR when it differs.",
-    )
-    parser.add_argument(
         "--create-static-for-no-ip",
         action="store_true",
         help="Create a placeholder STATIC tag for CMDB applications with no usable IPs "
@@ -1850,7 +1904,6 @@ def main() -> int:
     planner = ChangePlanner(
         applications,
         tag_model,
-        manage_color=args.manage_color,
         create_tags_without_ips=args.create_static_for_no_ip,
         rename_tags=args.rename_tags,
     )
@@ -1891,7 +1944,7 @@ def main() -> int:
         "Child tag name format": f"{CHILD_TAG_PREFIX}<ASSET>",
         "Resource status filter": ", ".join(sorted(INCLUDE_RESOURCE_STATUSES)),
         "Excluded IP blocks": ", ".join(EXCLUDED_IP_NETWORKS),
-        "Manage colour": "yes" if args.manage_color else "no",
+        "Tag colour policy": f"{DEFAULT_TAG_COLOR} default, {CRITICAL_TAG_COLOR} when RVIT=yes (unconditional, all tags)",
         "Create tags without IPs": "yes" if args.create_static_for_no_ip else "no",
         "Rename via GAID linkage": "yes" if args.rename_tags else "no",
     }
